@@ -663,11 +663,34 @@ class DPOTrainer(_BaseTrainer):
         self.f_alpha_divergence_coef = args.f_alpha_divergence_coef
         self.label_smoothing = args.label_smoothing
         self.use_weighting = args.use_weighting
+        self.trust_region_alpha = getattr(args, "trust_region_alpha", 0.0)
+        if not (0.0 <= self.trust_region_alpha <= 1.0):
+            raise ValueError("`trust_region_alpha` must lie in [0, 1].")
+        if self.trust_region_alpha > 0.0 and "distillm2_token" not in self.loss_types:
+            raise NotImplementedError(
+                "`trust_region_alpha` is currently only supported with `distillm2_token`."
+            )
         if self.use_weighting and any(loss_type in {"aot", "aot_unpaired"} for loss_type in self.loss_types):
             raise NotImplementedError(
                 "WPO-style weighting is not implemented for 'aot' or 'aot_unpaired' because those losses sort "
                 "samples, which would misalign per-pair weights."
             )
+        if "distillm2_token" in self.loss_types:
+            if len(self.loss_types) != 1:
+                raise NotImplementedError(
+                    "`distillm2_token` uses a dedicated token-level KL objective and cannot be mixed with other "
+                    "loss types in the same run."
+                )
+            if self.use_weighting:
+                raise NotImplementedError(
+                    "`use_weighting` is only defined for the sequence-level DPO losses and is not supported with "
+                    "`distillm2_token`."
+                )
+            if self.precompute_ref_logps:
+                raise NotImplementedError(
+                    "`distillm2_token` requires live reference logits. Disable `precompute_ref_log_probs` for this "
+                    "loss."
+                )
         if "robust" in self.loss_types and not (0.0 <= self.label_smoothing < 0.5):
             logger.warning(
                 "The `label_smoothing` parameter should lie in [0.0, 0.5) for the 'robust' loss. You provided "
@@ -680,6 +703,11 @@ class DPOTrainer(_BaseTrainer):
             )
         self.use_liger_kernel = args.use_liger_kernel
         if args.use_liger_kernel:
+            if "distillm2_token" in self.loss_types:
+                raise NotImplementedError(
+                    "`distillm2_token` needs full policy/reference logits and is not supported with the Liger fused "
+                    "DPO kernel."
+                )
             if not is_liger_kernel_available():
                 raise ImportError(
                     "You set `use_liger_kernel=True` but the liger kernel is not available. "
@@ -1751,6 +1779,89 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
                 "completion tokens. Check the custom collator or truncation settings."
             )
 
+    @staticmethod
+    def _compute_masked_token_kl_terms(
+        policy_shift_logits: torch.Tensor,
+        policy_shift_completion_mask: torch.Tensor,
+        reference_shift_logits: torch.Tensor,
+        reference_shift_completion_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute token-level forward/reverse KL on completion positions only."""
+        reference_shift_log_probs = F.log_softmax(reference_shift_logits, dim=-1)
+        return TeacherPromptAlignedDPOTrainer._compute_masked_token_kl_terms_from_log_probs(
+            policy_shift_logits,
+            policy_shift_completion_mask,
+            reference_shift_log_probs,
+            reference_shift_completion_mask,
+        )
+
+    @staticmethod
+    def _compute_masked_token_kl_terms_from_log_probs(
+        policy_shift_logits: torch.Tensor,
+        policy_shift_completion_mask: torch.Tensor,
+        reference_shift_log_probs: torch.Tensor,
+        reference_shift_completion_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute token-level forward/reverse KL from pre-normalized target log-probabilities."""
+        policy_log_probs = F.log_softmax(policy_shift_logits, dim=-1)
+
+        forward_kl_terms = []
+        reverse_kl_terms = []
+
+        for index in range(policy_shift_logits.size(0)):
+            policy_mask = policy_shift_completion_mask[index].bool()
+            reference_mask = reference_shift_completion_mask[index].bool()
+
+            policy_token_log_probs = policy_log_probs[index][policy_mask]
+            reference_token_log_probs = reference_shift_log_probs[index][reference_mask]
+
+            if policy_token_log_probs.size(0) != reference_token_log_probs.size(0):
+                raise ValueError(
+                    "TeacherPromptAlignedDPOTrainer requires aligned completion lengths to compute token-level KL."
+                )
+
+            if policy_token_log_probs.numel() == 0:
+                zero = policy_shift_logits.new_zeros(())
+                forward_kl_terms.append(zero)
+                reverse_kl_terms.append(zero)
+                continue
+
+            reference_token_probs = reference_token_log_probs.exp()
+            policy_token_probs = policy_token_log_probs.exp()
+
+            forward_kl = torch.sum(
+                reference_token_probs * (reference_token_log_probs - policy_token_log_probs), dim=-1
+            ).mean()
+            reverse_kl = torch.sum(
+                policy_token_probs * (policy_token_log_probs - reference_token_log_probs), dim=-1
+            ).mean()
+
+            forward_kl_terms.append(forward_kl)
+            reverse_kl_terms.append(reverse_kl)
+
+        return torch.stack(forward_kl_terms), torch.stack(reverse_kl_terms)
+
+    @staticmethod
+    def _mix_teacher_log_probs(
+        reference_shift_logits: torch.Tensor,
+        current_teacher_shift_logits: torch.Tensor | None,
+        trust_region_alpha: float,
+    ) -> torch.Tensor:
+        """Build a stop-gradient trust-region teacher in log-probability space."""
+        if not (0.0 <= trust_region_alpha <= 1.0):
+            raise ValueError("`trust_region_alpha` must lie in [0, 1].")
+
+        reference_log_probs = F.log_softmax(reference_shift_logits, dim=-1)
+        if trust_region_alpha == 0.0 or current_teacher_shift_logits is None:
+            return reference_log_probs
+
+        current_teacher_log_probs = F.log_softmax(current_teacher_shift_logits, dim=-1)
+        mixed_teacher_log_probs = (
+            (1.0 - trust_region_alpha) * reference_log_probs
+            + trust_region_alpha * current_teacher_log_probs
+        )
+        return mixed_teacher_log_probs - torch.logsumexp(mixed_teacher_log_probs, dim=-1, keepdim=True)
+
     def _prepare_dataset(
         self,
         dataset: Dataset | IterableDataset,
@@ -1906,6 +2017,13 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         teacher_shift_completion_mask = teacher_completion_mask[..., 1:].contiguous()
         self._validate_shared_completion_lengths(shift_completion_mask, teacher_shift_completion_mask)
 
+        uses_token_kl_loss = any(loss_type == "distillm2_token" for loss_type in self.loss_types)
+        if uses_token_kl_loss and self.precompute_ref_logps:
+            raise NotImplementedError(
+                "Token-level KL losses require live reference logits. Disable `precompute_ref_log_probs` for this loss."
+            )
+
+        current_teacher_shift_logits = None
         if self.precompute_ref_logps:
             ref_chosen_logps, ref_rejected_logps = inputs["ref_chosen_logps"], inputs["ref_rejected_logps"]
         else:
@@ -1916,6 +2034,10 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
             }
 
             with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                if uses_token_kl_loss and self.trust_region_alpha > 0.0:
+                    current_teacher_outputs = model(**teacher_model_kwargs)
+                    current_teacher_shift_logits = current_teacher_outputs.logits[..., :-1, :].contiguous()
+
                 if is_peft_model(model) and self.ref_model is None:
                     unwrapped_model = self.accelerator.unwrap_model(model)
                     with use_adapter(unwrapped_model, adapter_name="ref" if "ref" in unwrapped_model.peft_config else None):
@@ -1932,6 +2054,23 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
 
         chosen_logratios = chosen_logps - ref_chosen_logps
         rejected_logratios = rejected_logps - ref_rejected_logps
+        chosen_forward_kl = rejected_forward_kl = None
+        chosen_reverse_kl = rejected_reverse_kl = None
+
+        if uses_token_kl_loss:
+            teacher_target_shift_log_probs = self._mix_teacher_log_probs(
+                ref_shift_logits,
+                current_teacher_shift_logits,
+                self.trust_region_alpha,
+            )
+            forward_kl_terms, reverse_kl_terms = self._compute_masked_token_kl_terms_from_log_probs(
+                shift_logits,
+                shift_completion_mask,
+                teacher_target_shift_log_probs,
+                teacher_shift_completion_mask,
+            )
+            chosen_forward_kl, rejected_forward_kl = forward_kl_terms.chunk(2, dim=0)
+            chosen_reverse_kl, rejected_reverse_kl = reverse_kl_terms.chunk(2, dim=0)
 
         if self.f_divergence_type == "reverse_kl":
             chosen_scores = chosen_logratios
@@ -2042,11 +2181,19 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
                 chosen_mask, _ = shift_completion_mask.chunk(2, dim=0)
                 batch_loss = F.cross_entropy(chosen_logits[chosen_mask.bool()], chosen_labels[chosen_mask.bool()])
                 per_sequence_loss = batch_loss.expand(chosen_logits.size(0))
+            elif loss_type == "distillm2_token":
+                if chosen_forward_kl is None or rejected_reverse_kl is None:
+                    raise RuntimeError("Token-level KL terms were not computed for `distillm2_token`.")
+                if not (0.0 <= self.beta <= 1.0):
+                    raise ValueError(
+                        "For `distillm2_token`, `beta` is interpreted as the rejected/RKL mixing weight and must lie in [0, 1]."
+                    )
+                per_sequence_loss = (1.0 - self.beta) * chosen_forward_kl + self.beta * rejected_reverse_kl
             else:
                 raise ValueError(
                     f"Unknown loss type: {loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'exo_pair', "
                     "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_unpaired', 'apo_zero', 'apo_down', "
-                    "'discopop', 'sft']"
+                    "'discopop', 'sft', 'distillm2_token']"
                 )
 
             if self.use_weighting:
@@ -2099,8 +2246,14 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
         self._metrics[mode]["mean_token_accuracy"].append(accuracy)
 
-        chosen_rewards = self.beta * chosen_logratios.detach()
-        rejected_rewards = self.beta * rejected_logratios.detach()
+        if uses_token_kl_loss:
+            # Keep the familiar DPO-style reward dashboards available for side-by-side comparison.
+            chosen_rewards = chosen_logratios.detach()
+            rejected_rewards = rejected_logratios.detach()
+        else:
+            chosen_rewards = self.beta * chosen_logratios.detach()
+            rejected_rewards = self.beta * rejected_logratios.detach()
+
         agg_chosen_rewards = self.accelerator.gather(chosen_rewards)
         agg_rejected_rewards = self.accelerator.gather(rejected_rewards)
         self._metrics[mode]["rewards/chosen"].append(agg_chosen_rewards.mean().item())
@@ -2116,5 +2269,10 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
 
         self._metrics[mode]["logps/chosen"].append(self.accelerator.gather(chosen_logps).mean().item())
         self._metrics[mode]["logps/rejected"].append(self.accelerator.gather(rejected_logps).mean().item())
+
+        if chosen_forward_kl is not None and rejected_reverse_kl is not None:
+            self._metrics[mode]["kl/chosen_forward"].append(self.accelerator.gather(chosen_forward_kl.detach()).mean().item())
+            self._metrics[mode]["kl/rejected_reverse"].append(self.accelerator.gather(rejected_reverse_kl.detach()).mean().item())
+            self._metrics[mode]["teacher_mix/alpha"].append(self.trust_region_alpha)
 
         return (loss, outputs) if return_outputs else loss

@@ -169,6 +169,16 @@ class DPOConfig(trl.DPOConfig):
     """
 
     chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    trust_region_alpha: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Mixing weight for the trust-region teacher used by `distillm2_token`. "
+                "0 keeps the fixed reference teacher, while values in (0, 1] geometrically mix it "
+                "with the current model's teacher-prompt distribution under stop-gradient."
+            )
+        },
+    )
 
 
 @dataclass

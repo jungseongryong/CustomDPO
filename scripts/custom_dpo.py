@@ -65,6 +65,30 @@ python scripts/custom_dpo.py \
     --use_peft \
     --lora_r 32 \
     --lora_alpha 16
+
+# DistillM-2 token KL with trust-region teacher:
+python scripts/custom_dpo.py \
+    --dataset_name trl-lib/ultrafeedback_binarized \
+    --model_name_or_path Qwen/Qwen3-0.6B \
+    --teacher_chosen_prompt_instruction "Answer the user's request directly with the strongest possible assistant response. Prioritize correctness, helpfulness, clear task completion, and faithful instruction-following. Use careful reasoning when needed, but keep the visible answer natural, relevant, and well-structured. Avoid unsupported claims, unnecessary refusal, and irrelevant digressions." \
+    --teacher_rejected_prompt_instruction "Answer the user's request directly, but under a strict quality filter that rejects weak responses. Strongly avoid factual errors, shallow reasoning, contradiction, irrelevance, vagueness, unnecessary verbosity, missing user constraints, and overconfident unsupported claims. Prefer precise, coherent, grounded, and instruction-faithful answers." \
+    --learning_rate 5.0e-6 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 2 \
+    --per_device_eval_batch_size 2 \
+    --gradient_accumulation_steps 8 \
+    --gradient_checkpointing \
+    --logging_steps 25 \
+    --eval_strategy steps \
+    --eval_steps 200 \
+    --output_dir distillm2DPO_trust_region \
+    --no_remove_unused_columns \
+    --use_peft \
+    --lora_r 32 \
+    --lora_alpha 16 \
+    --loss_type distillm2_token \
+    --beta 0.5 \
+    --trust_region_alpha 0.4
 """
 
 import logging
