@@ -1541,72 +1541,123 @@ class DPOTrainer(_BaseTrainer):
 
 @dataclass
 class DataCollatorForTeacherPromptPreference(DataCollatorForPreference):
-    """Preference collator that also batches teacher-tokenized prompt/completion pairs."""
+    """Preference collator that shares completion tokens across student and teacher batches."""
 
-    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
-        output = super().torch_call(examples)
-
-        required_keys = {"teacher_prompt_ids", "teacher_chosen_ids", "teacher_rejected_ids"}
-        if not required_keys.issubset(examples[0]):
-            missing = sorted(required_keys.difference(examples[0]))
-            raise ValueError(
-                "DataCollatorForTeacherPromptPreference requires tokenized teacher fields. "
-                f"Missing keys in batch examples: {missing}"
-            )
-
-        teacher_prompt_chosen_ids = [example["teacher_prompt_ids"] + example["teacher_chosen_ids"] for example in examples]
-        teacher_prompt_rejected_ids = [example["teacher_prompt_ids"] + example["teacher_rejected_ids"] for example in examples]
-        teacher_chosen_mask = [
-            [0] * len(example["teacher_prompt_ids"]) + [1] * len(example["teacher_chosen_ids"])
-            for example in examples
-        ]
-        teacher_rejected_mask = [
-            [0] * len(example["teacher_prompt_ids"]) + [1] * len(example["teacher_rejected_ids"])
-            for example in examples
-        ]
-
-        if self.max_length is not None:
+    def _truncate_prompt_completion_pair(
+        self,
+        prompt_ids: list[int],
+        completion_ids: list[int],
+    ) -> tuple[list[int], list[int], list[int]]:
+        if self.max_length is None:
+            kept_prompt_ids = prompt_ids
+            kept_completion_ids = completion_ids
+        elif len(completion_ids) >= self.max_length:
+            kept_prompt_ids = []
             if self.truncation_mode == "keep_start":
-                teacher_prompt_chosen_ids = [ids[: self.max_length] for ids in teacher_prompt_chosen_ids]
-                teacher_prompt_rejected_ids = [ids[: self.max_length] for ids in teacher_prompt_rejected_ids]
-                teacher_chosen_mask = [mask[: self.max_length] for mask in teacher_chosen_mask]
-                teacher_rejected_mask = [mask[: self.max_length] for mask in teacher_rejected_mask]
+                kept_completion_ids = completion_ids[: self.max_length]
             elif self.truncation_mode == "keep_end":
-                teacher_prompt_chosen_ids = [ids[-self.max_length :] for ids in teacher_prompt_chosen_ids]
-                teacher_prompt_rejected_ids = [ids[-self.max_length :] for ids in teacher_prompt_rejected_ids]
-                teacher_chosen_mask = [mask[-self.max_length :] for mask in teacher_chosen_mask]
-                teacher_rejected_mask = [mask[-self.max_length :] for mask in teacher_rejected_mask]
+                kept_completion_ids = completion_ids[-self.max_length :]
+            else:
+                raise ValueError(
+                    f"Unsupported truncation mode: {self.truncation_mode}, expected 'keep_start' or 'keep_end'"
+                )
+        else:
+            available_prompt_tokens = self.max_length - len(completion_ids)
+            if self.truncation_mode == "keep_start":
+                kept_prompt_ids = prompt_ids[:available_prompt_tokens]
+            elif self.truncation_mode == "keep_end":
+                kept_prompt_ids = prompt_ids[-available_prompt_tokens:] if available_prompt_tokens > 0 else []
+            else:
+                raise ValueError(
+                    f"Unsupported truncation mode: {self.truncation_mode}, expected 'keep_start' or 'keep_end'"
+                )
+            kept_completion_ids = completion_ids
 
-        teacher_chosen_attention_mask = [[1] * len(ids) for ids in teacher_prompt_chosen_ids]
-        teacher_rejected_attention_mask = [[1] * len(ids) for ids in teacher_prompt_rejected_ids]
+        input_ids = kept_prompt_ids + kept_completion_ids
+        attention_mask = [1] * len(input_ids)
+        completion_mask = [0] * len(kept_prompt_ids) + [1] * len(kept_completion_ids)
+        return input_ids, attention_mask, completion_mask
 
-        teacher_input_ids = teacher_prompt_chosen_ids + teacher_prompt_rejected_ids
-        teacher_attention_mask = teacher_chosen_attention_mask + teacher_rejected_attention_mask
-        teacher_completion_mask = teacher_chosen_mask + teacher_rejected_mask
+    def _build_batch(
+        self,
+        examples: list[dict[str, Any]],
+        chosen_prompt_key: str,
+        rejected_prompt_key: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        chosen_sequences = [
+            self._truncate_prompt_completion_pair(example[chosen_prompt_key], example["chosen_ids"])
+            for example in examples
+        ]
+        rejected_sequences = [
+            self._truncate_prompt_completion_pair(example[rejected_prompt_key], example["rejected_ids"])
+            for example in examples
+        ]
+        sequences = chosen_sequences + rejected_sequences
 
-        output["teacher_input_ids"] = pad(
-            [torch.tensor(ids) for ids in teacher_input_ids],
+        input_ids = pad(
+            [torch.tensor(ids) for ids, _, _ in sequences],
             padding_value=self.pad_token_id,
             padding_side="right",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
-        output["teacher_attention_mask"] = pad(
-            [torch.tensor(mask, dtype=torch.long) for mask in teacher_attention_mask],
+        attention_mask = pad(
+            [torch.tensor(mask, dtype=torch.long) for _, mask, _ in sequences],
             padding_value=0,
             padding_side="right",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
-        output["teacher_completion_mask"] = pad(
-            [torch.tensor(mask, dtype=torch.long) for mask in teacher_completion_mask],
+        completion_mask = pad(
+            [torch.tensor(mask, dtype=torch.long) for _, _, mask in sequences],
             padding_value=0,
             padding_side="right",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
+        return input_ids, attention_mask, completion_mask
+
+    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        required_keys = {"prompt_ids", "chosen_ids", "rejected_ids"}
+        if not required_keys.issubset(examples[0]):
+            missing = sorted(required_keys.difference(examples[0]))
+            raise ValueError(
+                "DataCollatorForTeacherPromptPreference requires tokenized student prompt and completion fields. "
+                f"Missing keys in batch examples: {missing}"
+            )
+
+        has_split_teacher_prompts = {"teacher_chosen_prompt_ids", "teacher_rejected_prompt_ids"}.issubset(examples[0])
+        has_shared_teacher_prompt = "teacher_prompt_ids" in examples[0]
+        if not has_split_teacher_prompts and not has_shared_teacher_prompt:
+            raise ValueError(
+                "DataCollatorForTeacherPromptPreference requires either `teacher_prompt_ids` or both "
+                "`teacher_chosen_prompt_ids` and `teacher_rejected_prompt_ids`."
+            )
+
+        teacher_chosen_prompt_key = "teacher_chosen_prompt_ids" if has_split_teacher_prompts else "teacher_prompt_ids"
+        teacher_rejected_prompt_key = (
+            "teacher_rejected_prompt_ids" if has_split_teacher_prompts else "teacher_prompt_ids"
+        )
+
+        input_ids, attention_mask, completion_mask = self._build_batch(examples, "prompt_ids", "prompt_ids")
+        teacher_input_ids, teacher_attention_mask, teacher_completion_mask = self._build_batch(
+            examples, teacher_chosen_prompt_key, teacher_rejected_prompt_key
+        )
+
+        output = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "completion_mask": completion_mask,
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_completion_mask": teacher_completion_mask,
+        }
+        if "ref_chosen_logps" in examples[0]:
+            output["ref_chosen_logps"] = torch.tensor([example["ref_chosen_logps"] for example in examples])
+        if "ref_rejected_logps" in examples[0]:
+            output["ref_rejected_logps"] = torch.tensor([example["ref_rejected_logps"] for example in examples])
         return output
 
 
 class TeacherPromptAlignedDPOTrainer(DPOTrainer):
-    """DPO trainer that aligns policy/reference losses on the shared completion suffix."""
+    """DPO trainer that tokenizes teacher prompts separately and shares completion tokens with the student."""
 
     _tag_names = ["trl", "dpo", "teacher-prompt-aligned"]
 
@@ -1627,7 +1678,9 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         self._teacher_prompt_in_raw_dataset = False
         if train_dataset is not None:
             sample = next(iter(train_dataset))
-            self._teacher_prompt_in_raw_dataset = "teacher_prompt" in sample
+            self._teacher_prompt_in_raw_dataset = any(
+                key in sample for key in ("teacher_prompt", "teacher_chosen_prompt", "teacher_rejected_prompt")
+            )
             if self._teacher_prompt_in_raw_dataset and ("image" in sample or "images" in sample):
                 raise NotImplementedError(
                     "TeacherPromptAlignedDPOTrainer currently supports text-only datasets. "
@@ -1686,29 +1739,17 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         return value[0] if value and isinstance(value[0], list) else value
 
     @staticmethod
-    def _build_suffix_alignment_masks(
+    def _validate_shared_completion_lengths(
         policy_completion_mask: torch.Tensor,
         reference_completion_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        policy_completion_mask = policy_completion_mask.bool()
-        reference_completion_mask = reference_completion_mask.bool()
-        aligned_policy_mask = torch.zeros_like(policy_completion_mask)
-        aligned_reference_mask = torch.zeros_like(reference_completion_mask)
-
-        for idx in range(policy_completion_mask.size(0)):
-            policy_positions = policy_completion_mask[idx].nonzero(as_tuple=False).flatten()
-            reference_positions = reference_completion_mask[idx].nonzero(as_tuple=False).flatten()
-            aligned_token_count = min(policy_positions.numel(), reference_positions.numel())
-            if aligned_token_count == 0:
-                raise ValueError(
-                    "No overlapping completion tokens remain after teacher/student prompt alignment. "
-                    "Check whether truncation consumed the completion tokens."
-                )
-
-            aligned_policy_mask[idx, policy_positions[-aligned_token_count:]] = True
-            aligned_reference_mask[idx, reference_positions[-aligned_token_count:]] = True
-
-        return aligned_policy_mask, aligned_reference_mask
+    ) -> None:
+        policy_lengths = policy_completion_mask.long().sum(dim=1)
+        reference_lengths = reference_completion_mask.long().sum(dim=1)
+        if not torch.equal(policy_lengths, reference_lengths):
+            raise ValueError(
+                "TeacherPromptAlignedDPOTrainer expects teacher and student batches to share the same number of "
+                "completion tokens. Check the custom collator or truncation settings."
+            )
 
     def _prepare_dataset(
         self,
@@ -1721,7 +1762,9 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
 
         if self._is_vision_dataset:
             first_example = next(iter(dataset))
-            if "teacher_prompt" in first_example:
+            if any(
+                key in first_example for key in ("teacher_prompt", "teacher_chosen_prompt", "teacher_rejected_prompt")
+            ):
                 raise NotImplementedError(
                     "TeacherPromptAlignedDPOTrainer does not yet support teacher-specific prompts for vision datasets."
                 )
@@ -1736,69 +1779,34 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
                 map_kwargs["desc"] = f"Tokenizing teacher prompts for {dataset_name} dataset"
 
             def tokenize_teacher_fn(example, processing_class):
-                if "teacher_prompt" not in example or example["teacher_prompt"] == example["prompt"]:
-                    return {
-                        "teacher_prompt_ids": example["prompt_ids"],
-                        "teacher_chosen_ids": example["chosen_ids"],
-                        "teacher_rejected_ids": example["rejected_ids"],
-                    }
-
                 tools = example.get("tools")
                 tools = json.loads(tools) if isinstance(tools, str) else tools
-                teacher_prompt = example["teacher_prompt"]
 
-                if is_conversational(example):
-                    teacher_prompt_ids = processing_class.apply_chat_template(
-                        teacher_prompt,
-                        tools=tools,
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        return_dict=False,
-                        **example.get("chat_template_kwargs", {}),
-                    )
-                    teacher_prompt_chosen_processed = processing_class.apply_chat_template(
-                        teacher_prompt + example["chosen"],
-                        tools=tools,
-                        tokenize=True,
-                        return_dict=True,
-                        **example.get("chat_template_kwargs", {}),
-                    )
-                    teacher_prompt_rejected_processed = processing_class.apply_chat_template(
-                        teacher_prompt + example["rejected"],
-                        tools=tools,
-                        tokenize=True,
-                        return_dict=True,
-                        **example.get("chat_template_kwargs", {}),
-                    )
-                    teacher_prompt_ids = self._maybe_unbatch_token_ids(teacher_prompt_ids)
-                    teacher_prompt_chosen_ids = self._maybe_unbatch_token_ids(teacher_prompt_chosen_processed["input_ids"])
-                    teacher_prompt_rejected_ids = self._maybe_unbatch_token_ids(teacher_prompt_rejected_processed["input_ids"])
-                else:
-                    teacher_prompt_ids = self._maybe_unbatch_token_ids(
-                        processing_class(text=teacher_prompt)["input_ids"]
-                    )
-                    teacher_prompt_chosen_ids = self._maybe_unbatch_token_ids(
-                        processing_class(text=teacher_prompt + example["chosen"])["input_ids"]
-                    )
-                    teacher_prompt_rejected_ids = self._maybe_unbatch_token_ids(
-                        processing_class(text=teacher_prompt + example["rejected"])["input_ids"]
-                    )
+                def resolve_teacher_prompt(field_name):
+                    if field_name in example and example[field_name] is not None:
+                        return example[field_name]
+                    if "teacher_prompt" in example and example["teacher_prompt"] is not None:
+                        return example["teacher_prompt"]
+                    return example["prompt"]
 
-                if teacher_prompt_chosen_ids[: len(teacher_prompt_ids)] != teacher_prompt_ids:
-                    logger.warning(
-                        "Mismatch between tokenized teacher prompt and tokenized teacher prompt+chosen. "
-                        "Prompt-aligned DPO will still compare only the overlapping completion suffix."
-                    )
-                if teacher_prompt_rejected_ids[: len(teacher_prompt_ids)] != teacher_prompt_ids:
-                    logger.warning(
-                        "Mismatch between tokenized teacher prompt and tokenized teacher prompt+rejected. "
-                        "Prompt-aligned DPO will still compare only the overlapping completion suffix."
-                    )
+                def tokenize_prompt(prompt_value):
+                    if prompt_value == example["prompt"]:
+                        return example["prompt_ids"]
+                    if is_conversational({"prompt": prompt_value}):
+                        prompt_ids = processing_class.apply_chat_template(
+                            prompt_value,
+                            tools=tools,
+                            add_generation_prompt=True,
+                            tokenize=True,
+                            return_dict=False,
+                            **example.get("chat_template_kwargs", {}),
+                        )
+                        return self._maybe_unbatch_token_ids(prompt_ids)
+                    return self._maybe_unbatch_token_ids(processing_class(text=prompt_value)["input_ids"])
 
                 return {
-                    "teacher_prompt_ids": teacher_prompt_ids,
-                    "teacher_chosen_ids": teacher_prompt_chosen_ids[len(teacher_prompt_ids) :],
-                    "teacher_rejected_ids": teacher_prompt_rejected_ids[len(teacher_prompt_ids) :],
+                    "teacher_chosen_prompt_ids": tokenize_prompt(resolve_teacher_prompt("teacher_chosen_prompt")),
+                    "teacher_rejected_prompt_ids": tokenize_prompt(resolve_teacher_prompt("teacher_rejected_prompt")),
                 }
 
             dataset = dataset.map(tokenize_teacher_fn, fn_kwargs={"processing_class": processing_class}, **map_kwargs)
@@ -1814,8 +1822,8 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
                 "chosen_ids",
                 "rejected_ids",
                 "teacher_prompt_ids",
-                "teacher_chosen_ids",
-                "teacher_rejected_ids",
+                "teacher_chosen_prompt_ids",
+                "teacher_rejected_prompt_ids",
                 "ref_chosen_logps",
                 "ref_rejected_logps",
             ]
@@ -1835,11 +1843,6 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         if self.ld_alpha is not None:
             raise NotImplementedError("Teacher-prompt alignment does not currently support `ld_alpha`.")
 
-        input_ids, attention_mask, completion_mask = self._truncate_inputs(
-            inputs["input_ids"],
-            inputs["attention_mask"],
-            inputs["completion_mask"],
-        )
         teacher_input_ids, teacher_attention_mask, teacher_completion_mask = self._truncate_inputs(
             inputs["teacher_input_ids"],
             inputs["teacher_attention_mask"],
@@ -1866,11 +1869,7 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         ref_per_token_logps = selective_log_softmax(ref_shift_logits, ref_shift_labels)
         ref_per_token_logps[ref_shift_completion_mask == 0] = 0.0
 
-        _, aligned_reference_mask = self._build_suffix_alignment_masks(
-            completion_mask[..., 1:].contiguous(),
-            ref_shift_completion_mask,
-        )
-        ref_logps = (ref_per_token_logps * aligned_reference_mask.to(ref_per_token_logps.dtype)).sum(dim=1)
+        ref_logps = ref_per_token_logps.sum(dim=1)
         return ref_logps.chunk(2, dim=0)
 
     def _compute_loss(self, model, inputs, return_outputs):
@@ -1898,18 +1897,14 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         outputs = model(**model_kwargs)
         shift_logits = outputs.logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
-        raw_shift_completion_mask = completion_mask[..., 1:].contiguous()
+        shift_completion_mask = completion_mask[..., 1:].contiguous()
         per_token_logps = selective_log_softmax(shift_logits, shift_labels)
-        per_token_logps[raw_shift_completion_mask == 0] = 0.0
+        per_token_logps[shift_completion_mask == 0] = 0.0
+        logps = per_token_logps.sum(dim=1)
+        chosen_logps, rejected_logps = logps.chunk(2, dim=0)
 
         teacher_shift_completion_mask = teacher_completion_mask[..., 1:].contiguous()
-        shift_completion_mask, aligned_reference_mask = self._build_suffix_alignment_masks(
-            raw_shift_completion_mask,
-            teacher_shift_completion_mask,
-        )
-        aligned_completion_mask = shift_completion_mask.to(per_token_logps.dtype)
-        logps = (per_token_logps * aligned_completion_mask).sum(dim=1)
-        chosen_logps, rejected_logps = logps.chunk(2, dim=0)
+        self._validate_shared_completion_lengths(shift_completion_mask, teacher_shift_completion_mask)
 
         if self.precompute_ref_logps:
             ref_chosen_logps, ref_rejected_logps = inputs["ref_chosen_logps"], inputs["ref_rejected_logps"]
@@ -1932,7 +1927,7 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
             ref_shift_labels = teacher_input_ids[..., 1:].contiguous()
             ref_per_token_logps = selective_log_softmax(ref_shift_logits, ref_shift_labels)
             ref_per_token_logps[teacher_shift_completion_mask == 0] = 0.0
-            ref_logps = (ref_per_token_logps * aligned_reference_mask.to(ref_per_token_logps.dtype)).sum(dim=1)
+            ref_logps = ref_per_token_logps.sum(dim=1)
             ref_chosen_logps, ref_rejected_logps = ref_logps.chunk(2, dim=0)
 
         chosen_logratios = chosen_logps - ref_chosen_logps
@@ -1973,7 +1968,7 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
             elif loss_type == "hinge":
                 per_sequence_loss = torch.relu(1 - self.beta * delta_score)
             elif loss_type == "ipo":
-                chosen_mask, rejected_mask = aligned_completion_mask.chunk(2, dim=0)
+                chosen_mask, rejected_mask = shift_completion_mask.chunk(2, dim=0)
                 chosen_avg_score = chosen_scores / chosen_mask.sum(dim=1).clamp(min=1.0)
                 rejected_avg_score = rejected_scores / rejected_mask.sum(dim=1).clamp(min=1.0)
                 ipo_delta = chosen_avg_score - rejected_avg_score
@@ -2055,12 +2050,12 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
                 )
 
             if self.use_weighting:
-                completion_lengths = aligned_completion_mask.sum(dim=1).clamp_min(1)
+                completion_lengths = shift_completion_mask.sum(dim=1).clamp_min(1)
                 with torch.no_grad():
                     lse1 = torch.logsumexp(shift_logits, dim=-1)
                     lse2 = torch.logsumexp(2.0 * shift_logits, dim=-1)
                     log_denom = lse2 - 2.0 * lse1
-                    aligned_logps = (per_token_logps - log_denom) * aligned_completion_mask
+                    aligned_logps = (per_token_logps - log_denom) * shift_completion_mask
                 mean_logps = aligned_logps.sum(dim=1) / completion_lengths
                 weights = torch.exp(mean_logps)
                 chosen_weights, rejected_weights = weights.chunk(2, dim=0)
@@ -2069,7 +2064,7 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
             loss += per_sequence_loss.mean() * loss_weight
 
         per_token_entropy = entropy_from_logits(shift_logits.detach())
-        entropy = per_token_entropy[shift_completion_mask].mean()
+        entropy = per_token_entropy[shift_completion_mask.bool()].mean()
         entropy = self.accelerator.gather_for_metrics(entropy).mean().item()
         self._metrics[mode]["entropy"].append(entropy)
 
@@ -2080,9 +2075,9 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
 
         chosen_logits, rejected_logits = shift_logits.detach().chunk(2, dim=0)
         chosen_mask, rejected_mask = shift_completion_mask.chunk(2, dim=0)
-        total_chosen_logits = chosen_logits[chosen_mask].mean(-1).sum()
+        total_chosen_logits = chosen_logits[chosen_mask.bool()].mean(-1).sum()
         total_chosen_tokens = chosen_mask.sum()
-        total_rejected_logits = rejected_logits[rejected_mask].mean(-1).sum()
+        total_rejected_logits = rejected_logits[rejected_mask.bool()].mean(-1).sum()
         total_rejected_tokens = rejected_mask.sum()
         total_chosen_logits = self.accelerator.gather_for_metrics(total_chosen_logits).sum().item()
         total_chosen_tokens = self.accelerator.gather_for_metrics(total_chosen_tokens).sum().item()
@@ -2095,7 +2090,7 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
 
         predictions = chosen_logits.argmax(dim=-1)
         chosen_labels = shift_labels[: len(shift_labels) // 2]
-        correct_predictions = (predictions == chosen_labels) & chosen_mask
+        correct_predictions = (predictions == chosen_labels) & chosen_mask.bool()
         total_tokens = chosen_mask.sum()
         correct_tokens = correct_predictions.sum()
         correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)

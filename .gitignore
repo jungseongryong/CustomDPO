@@ -164,6 +164,7 @@ data/
 wandb/
 
 # Training outputs / checkpoints
+*-CustomDPO*/
 *-DPO/
 *-ORPO/
 checkpoints/

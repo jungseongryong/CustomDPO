@@ -89,6 +89,24 @@ class ScriptArguments(trl.ScriptArguments):
         default=None,
         metadata={"help": "Configuration for creating dataset mixtures with advanced options like shuffling."},
     )
+    teacher_prompt_instruction: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional instruction inserted into teacher/ref prompts for custom DPO training.",
+        },
+    )
+    teacher_chosen_prompt_instruction: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional instruction inserted only into the teacher/ref prompt for the chosen branch.",
+        },
+    )
+    teacher_rejected_prompt_instruction: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional instruction inserted only into the teacher/ref prompt for the rejected branch.",
+        },
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:

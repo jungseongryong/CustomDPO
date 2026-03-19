@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +29,25 @@ python scripts/custom_dpo.py \
     --output_dir Qwen2-0.5B-DPO \
     --no_remove_unused_columns
 
+# Teacher prompt:
+python scripts/custom_dpo.py \
+    --dataset_name trl-lib/ultrafeedback_binarized \
+    --model_name_or_path Qwen/Qwen2-0.5B-Instruct \
+    --teacher_prompt_instruction "Think step by step and provide your own answer." \
+    --learning_rate 5.0e-6 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 8 \
+    --gradient_checkpointing \
+    --logging_steps 25 \
+    --eval_strategy steps \
+    --eval_steps 50 \
+    --output_dir Qwen2-0.5B-CustomDPO \
+    --no_remove_unused_columns \
+    --use_peft \
+    --lora_r 32 \
+    --lora_alpha 16
+
 # LoRA:
 python scripts/custom_dpo.py \
     --dataset_name trl-lib/ultrafeedback_binarized \
@@ -48,6 +68,7 @@ python scripts/custom_dpo.py \
 """
 
 import logging
+from copy import deepcopy
 import os
 import sys
 
@@ -59,9 +80,60 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import DPOConfig, ScriptArguments, TeacherPromptAlignedDPOTrainer, get_dataset, get_model, get_tokenizer
 from trl import ModelConfig, TrlParser, get_peft_config
+from trl.data_utils import extract_prompt, is_conversational
 
 
 logger = logging.getLogger(__name__)
+
+
+def inject_instruction_into_prompt(prompt, instruction):
+    instruction = instruction.strip()
+
+    if isinstance(prompt, str):
+        return f"{instruction}\n\n{prompt}"
+
+    if is_conversational({"prompt": prompt}):
+        teacher_prompt = deepcopy(prompt)
+        if teacher_prompt and teacher_prompt[0].get("role") == "system":
+            system_message = deepcopy(teacher_prompt[0])
+            prefix = system_message.get("content", "")
+            system_message["content"] = f"{prefix}\n\n{instruction}".strip() if prefix else instruction
+            teacher_prompt[0] = system_message
+        else:
+            teacher_prompt = [{"role": "system", "content": instruction}] + teacher_prompt
+        return teacher_prompt
+
+    raise TypeError(f"Unsupported prompt type for teacher prompt injection: {type(prompt)}")
+
+
+def build_teacher_prompts(example, shared_instruction=None, chosen_instruction=None, rejected_instruction=None):
+    prompt = example["prompt"]
+    shared_instruction = shared_instruction.strip() if shared_instruction else None
+    chosen_instruction = chosen_instruction.strip() if chosen_instruction else None
+    rejected_instruction = rejected_instruction.strip() if rejected_instruction else None
+
+    chosen_effective = chosen_instruction or shared_instruction
+    rejected_effective = rejected_instruction or shared_instruction
+
+    if chosen_effective is None and rejected_effective is None:
+        return example
+
+    def get_fallback_prompt():
+        if "teacher_prompt" in example and example["teacher_prompt"] is not None:
+            return deepcopy(example["teacher_prompt"])
+        return deepcopy(prompt)
+
+    example["teacher_chosen_prompt"] = (
+        inject_instruction_into_prompt(prompt, chosen_effective) if chosen_effective else get_fallback_prompt()
+    )
+    example["teacher_rejected_prompt"] = (
+        inject_instruction_into_prompt(prompt, rejected_effective) if rejected_effective else get_fallback_prompt()
+    )
+
+    if chosen_effective is not None and chosen_effective == rejected_effective:
+        example["teacher_prompt"] = deepcopy(example["teacher_chosen_prompt"])
+
+    return example
 
 
 def main(script_args, training_args, model_args):
@@ -113,6 +185,26 @@ def main(script_args, training_args, model_args):
     #########
     dataset = get_dataset(script_args)
     for split in dataset:
+        if "prompt" not in dataset[split].column_names:
+            dataset[split] = dataset[split].map(extract_prompt, desc=f"Extracting prompt for {split} split")
+
+        if any(
+            [
+                script_args.teacher_prompt_instruction,
+                script_args.teacher_chosen_prompt_instruction,
+                script_args.teacher_rejected_prompt_instruction,
+            ]
+        ):
+            dataset[split] = dataset[split].map(
+                build_teacher_prompts,
+                fn_kwargs={
+                    "shared_instruction": script_args.teacher_prompt_instruction,
+                    "chosen_instruction": script_args.teacher_chosen_prompt_instruction,
+                    "rejected_instruction": script_args.teacher_rejected_prompt_instruction,
+                },
+                desc=f"Adding teacher prompts for {split} split",
+            )
+
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
