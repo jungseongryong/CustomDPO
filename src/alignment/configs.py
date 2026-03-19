@@ -32,6 +32,11 @@ from typing import Any, Optional
 
 import trl
 
+try:
+    _ORPOConfigBase = trl.ORPOConfig
+except AttributeError:
+    from trl.experimental.orpo import ORPOConfig as _ORPOConfigBase
+
 
 @dataclass
 class DatasetConfig:
@@ -149,7 +154,7 @@ class DPOConfig(trl.DPOConfig):
 
 
 @dataclass
-class ORPOConfig(trl.ORPOConfig):
+class ORPOConfig(_ORPOConfigBase):
     """
     args for callbacks, benchmarks etc
     """
