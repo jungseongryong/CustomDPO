@@ -655,6 +655,7 @@ class DPOTrainer(_BaseTrainer):
 
         # Training arguments
         self.beta = args.beta
+        self.rkl_weight = getattr(args, "rkl_weight", None)
         self.precompute_ref_logps = args.precompute_ref_log_probs
         self.loss_types = args.loss_type  # args.loss_type is already a list
         self.loss_weights = args.loss_weights or [1.0] * len(self.loss_types)
@@ -690,6 +691,13 @@ class DPOTrainer(_BaseTrainer):
                 raise NotImplementedError(
                     "`distillm2_token` requires live reference logits. Disable `precompute_ref_log_probs` for this "
                     "loss."
+                )
+            if self.rkl_weight is not None and not (0.0 <= self.rkl_weight <= 1.0):
+                raise ValueError("`rkl_weight` must lie in [0, 1] when provided for `distillm2_token`.")
+            if self.beta <= 0.0:
+                raise ValueError(
+                    "`beta` must be strictly positive when using `distillm2_token` because reward dashboards are "
+                    "logged on the standard DPO scale (`beta * logratio`)."
                 )
         if "robust" in self.loss_types and not (0.0 <= self.label_smoothing < 0.5):
             logger.warning(
@@ -1894,6 +1902,8 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
                 tools = json.loads(tools) if isinstance(tools, str) else tools
 
                 def resolve_teacher_prompt(field_name):
+                    if dataset_name == "eval":
+                        return example["prompt"]
                     if field_name in example and example[field_name] is not None:
                         return example[field_name]
                     if "teacher_prompt" in example and example["teacher_prompt"] is not None:
@@ -2184,11 +2194,12 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
             elif loss_type == "distillm2_token":
                 if chosen_forward_kl is None or rejected_reverse_kl is None:
                     raise RuntimeError("Token-level KL terms were not computed for `distillm2_token`.")
-                if not (0.0 <= self.beta <= 1.0):
+                mixing_weight = 0.5 if self.rkl_weight is None else self.rkl_weight
+                if not (0.0 <= mixing_weight <= 1.0):
                     raise ValueError(
-                        "For `distillm2_token`, `beta` is interpreted as the rejected/RKL mixing weight and must lie in [0, 1]."
+                        "For `distillm2_token`, `rkl_weight` must lie in [0, 1]."
                     )
-                per_sequence_loss = (1.0 - self.beta) * chosen_forward_kl + self.beta * rejected_reverse_kl
+                per_sequence_loss = (1.0 - mixing_weight) * chosen_forward_kl + mixing_weight * rejected_reverse_kl
             else:
                 raise ValueError(
                     f"Unknown loss type: {loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'exo_pair', "
@@ -2246,13 +2257,9 @@ class TeacherPromptAlignedDPOTrainer(DPOTrainer):
         accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
         self._metrics[mode]["mean_token_accuracy"].append(accuracy)
 
-        if uses_token_kl_loss:
-            # Keep the familiar DPO-style reward dashboards available for side-by-side comparison.
-            chosen_rewards = chosen_logratios.detach()
-            rejected_rewards = rejected_logratios.detach()
-        else:
-            chosen_rewards = self.beta * chosen_logratios.detach()
-            rejected_rewards = self.beta * rejected_logratios.detach()
+        # Keep reward dashboards on the standard DPO scale for all loss types.
+        chosen_rewards = self.beta * chosen_logratios.detach()
+        rejected_rewards = self.beta * rejected_logratios.detach()
 
         agg_chosen_rewards = self.accelerator.gather(chosen_rewards)
         agg_rejected_rewards = self.accelerator.gather(rejected_rewards)

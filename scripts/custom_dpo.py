@@ -67,6 +67,8 @@ python scripts/custom_dpo.py \
     --lora_alpha 16
 
 # DistillM-2 token KL with trust-region teacher:
+# For `distillm2_token`, `rkl_weight` controls the training loss mix.
+# `beta` does not affect the token-KL objective itself; it only sets the DPO-style reward logging scale.
 python scripts/custom_dpo.py \
     --dataset_name trl-lib/ultrafeedback_binarized \
     --model_name_or_path Qwen/Qwen3-0.6B \
@@ -87,19 +89,26 @@ python scripts/custom_dpo.py \
     --lora_r 32 \
     --lora_alpha 16 \
     --loss_type distillm2_token \
-    --beta 0.5 \
+    --beta 0.1 \
+    --rkl_weight 0.5 \
     --trust_region_alpha 0.4
 """
 
 import logging
 from copy import deepcopy
 import os
+from pathlib import Path
 import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 import datasets
 import torch
 import transformers
-from transformers import set_seed
+from transformers import AutoTokenizer, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import DPOConfig, ScriptArguments, TeacherPromptAlignedDPOTrainer, get_dataset, get_model, get_tokenizer
@@ -160,6 +169,49 @@ def build_teacher_prompts(example, shared_instruction=None, chosen_instruction=N
     return example
 
 
+def load_reference_model_and_validate_token_space(script_args, model_args, training_args, tokenizer, model):
+    if script_args.teacher_model_name_or_path is None:
+        ref_model = get_model(model_args, training_args)
+        return ref_model
+
+    teacher_model_args = deepcopy(model_args)
+    teacher_model_args.model_name_or_path = script_args.teacher_model_name_or_path
+    ref_model = get_model(teacher_model_args, training_args)
+
+    teacher_tokenizer_name = script_args.teacher_tokenizer_name_or_path or script_args.teacher_model_name_or_path
+    teacher_tokenizer = AutoTokenizer.from_pretrained(
+        teacher_tokenizer_name,
+        revision=model_args.model_revision,
+        trust_remote_code=model_args.trust_remote_code,
+    )
+
+    if tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
+        raise ValueError(
+            "Teacher/reference tokenizer must share the exact same token-to-id mapping as the student tokenizer. "
+            "Provide a compatible teacher model or tokenizer before using TeacherPromptAlignedDPOTrainer."
+        )
+
+    student_vocab_size = model.get_output_embeddings().weight.shape[0]
+    teacher_vocab_size = ref_model.get_output_embeddings().weight.shape[0]
+    if student_vocab_size != teacher_vocab_size:
+        raise ValueError(
+            "Teacher/reference model must have the same LM-head vocab size as the student model. "
+            f"Got student={student_vocab_size}, teacher={teacher_vocab_size}."
+        )
+
+    if getattr(model.config, "is_encoder_decoder", False) != getattr(ref_model.config, "is_encoder_decoder", False):
+        raise ValueError(
+            "Student and teacher/reference must expose the same decoder interface. "
+            "Mixing encoder-decoder and causal-LM teachers is not supported here."
+        )
+
+    logger.info(
+        "Loaded separate teacher/reference model %s with tokenizer-compatible token space.",
+        script_args.teacher_model_name_or_path,
+    )
+    return ref_model
+
+
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
@@ -194,8 +246,14 @@ def main(script_args, training_args, model_args):
     # Model & Tokenizer
     ###################
     model = get_model(model_args, training_args)
-    ref_model = get_model(model_args, training_args)
     tokenizer = get_tokenizer(model_args, training_args)
+    ref_model = load_reference_model_and_validate_token_space(
+        script_args,
+        model_args,
+        training_args,
+        tokenizer,
+        model,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if script_args.ignore_bias_buffers:

@@ -107,6 +107,24 @@ class ScriptArguments(trl.ScriptArguments):
             "help": "Optional instruction inserted only into the teacher/ref prompt for the rejected branch.",
         },
     )
+    teacher_model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional separate teacher/reference model for TeacherPromptAlignedDPOTrainer. "
+                "This model must share the same token-id space as the student when used with token-level KL."
+            ),
+        },
+    )
+    teacher_tokenizer_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional tokenizer path for the teacher/reference model. If unset, the teacher model path is used "
+                "for tokenizer compatibility checks."
+            ),
+        },
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:
@@ -169,6 +187,15 @@ class DPOConfig(trl.DPOConfig):
     """
 
     chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    rkl_weight: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Rejected-side reverse-KL mixing weight for `distillm2_token`. If unset, the trainer uses 0.5 so "
+                "the chosen forward KL and rejected reverse KL are weighted equally."
+            )
+        },
+    )
     trust_region_alpha: float = field(
         default=0.0,
         metadata={
